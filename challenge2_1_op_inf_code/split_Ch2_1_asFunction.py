@@ -18,10 +18,10 @@ n 	= 51*154*2      # number of values per snapshot
 nx  = int(n/ns)
 
 # full length of dataset is 12800 snapshots
-nt	= 400
+nt	= 70
 # number of time instants over the time domain of interest (training + prediction)
 # we are going to predict 100 snapshots from the first 400
-nt_p = 500
+nt_p = 100
 
 # state variable names
 state_variables = ['ux', 'uy']
@@ -34,10 +34,10 @@ H5_training_snapshots 	= '../challenge_data/Challenge2_1_train.h5'
 target_ret_energy = 0.9996
 
 # ranges for the regularization parameter pairs
-B1 = np.logspace(-8., 2., num=10)
+B1 = np.logspace(-8., 8., num=50)
 # B1 = np.logspace(-10., 10., num=50) # the bigger space was for testing on a stronger computer than my laptop
 
-B2 = np.logspace(-4., 4., num=10)
+B2 = np.logspace(-8., 8., num=50)
 # B2 = np.logspace(-10., 10., num=50) # or 100
 
 
@@ -48,7 +48,7 @@ max_growth = 1.2
 CENTERING = True
 
 # flag to determine whether the (transformed) training data are scaled by the maximum absolute value of each state variable
-SCALING = False
+SCALING = True
 
 # flag to determine whether we postprocess the OpInf reduced solution
 POSTPROC = True
@@ -59,7 +59,7 @@ POSTPROC_FULL_DOM_SOL = True
 
 # flag to determine whether we compute the ROM approximate solution in the original coordinates
 # at user specified probe locations (specified in target_probe_indices)
-POSTPROC_PROBES = False
+POSTPROC_PROBES = True
 
 # time instants at which to save the OpInf approximate solutions mappend to the original coordinates
 target_time_instants 	= [-1]
@@ -122,8 +122,8 @@ def solve(r):
 	print("\n\nx component: min = " + str(np.min(Q_global[j*nx : (j + 1)*nx, :])) + "   max = "+ str(np.max(Q_global[j*nx : (j + 1)*nx, :])), file=out_file)
 	j=1
 	print("y component: min = " + str(np.min(Q_global[j*nx : (j + 1)*nx, :])) + "   max = "+ str(np.max(Q_global[j*nx : (j + 1)*nx, :])), file=out_file)
-
-	
+	Q_global_original = Q_global.copy()
+	scaling_params = np.ones(ns)
     ## actually performing the desired operations
 	if CENTERING:
 		# compute the global temporal mean of each variable
@@ -143,6 +143,7 @@ def solve(r):
 
 			# scale each centered variable by its corresponding global scaling parameter
 			Q_global[j*nx : (j + 1)*nx, :] /= scaling_param_global
+			scaling_params[j] = np.maximum(np.abs(min_centered_var_global), np.abs(max_centered_var_global))
 	#################### STEP II END ##########################
 
 	
@@ -211,6 +212,7 @@ def solve(r):
 	beta1_opt = None
 
 	# loop over the regularization pairs corresponding to each MPI rank
+	count = 0
 	for pair in reg_pairs_global:
 
 		# extract beta1 and beta2 from each candidate regularization pair
@@ -248,18 +250,42 @@ def solve(r):
 			train_err     			= compute_train_err(Qhat_global.T[:nt, :], Qtilde_OpInf[:nt, :])
 			max_diff_Qhat_trial  	= np.max(np.abs(Qtilde_OpInf - mean_Qhat_train), axis=0)			
 			max_growth_trial  		= np.max(max_diff_Qhat_trial)/np.max(max_diff_Qhat_train)
+			errors.append(train_err)
 
 			if max_growth_trial < max_growth:
-
+				count = count +1
 				if train_err < opt_train_err:
 					opt_train_err 				= train_err
 					Qtilde_OpInf_opt 			= Qtilde_OpInf
 
 					beta1_opt = pair[0]
 					beta2_opt = pair[1]
-		errors.append(opt_train_err)
+		else:
+			errors.append(np.nan)
 
-	####################### STEP IV END #############################
+	# print("\n\nNumber of regularization pairs that produced a solution with max growth < " + str(max_growth) + " : " + str(count))
+	# B1_grid, B2_grid = np.meshgrid(B1, B2, indexing='ij')
+
+	# Z = np.array(errors).reshape(len(B1), len(B2))
+
+	# fig = plt.figure()
+	# ax = fig.add_subplot(projection='3d')
+
+	# surf = ax.plot_surface(
+	# 	np.log10(B1_grid),
+	# 	np.log10(B2_grid),
+	# 	Z,
+	# 	cmap='viridis'
+	# )
+
+	# ax.set_xlabel('log10(beta1)')
+	# ax.set_ylabel('log10(beta2)')
+	# ax.set_zlabel('Training Error')
+
+	# fig.colorbar(surf, shrink=0.5, aspect=5)
+
+	# plt.show()
+	# ####################### STEP IV END #############################
 	print("Optimal training error: ", opt_train_err, file=out_file)
 	# reporting chosen beta1 and beta2
 	if (beta1_opt != None):
@@ -272,8 +298,20 @@ def solve(r):
 			# compute the global POD basis vectors
 			Phir_global = np.matmul(Q_global, Tr_global)
 			print("Phi_r Global size: ", np.size(Phir_global))
+			Qhat_check = Phir_global.T @ Q_global
+			Q_rec_scaled = Phir_global @ Qhat_check
+			Q_rec = Q_rec_scaled.copy()
 
-			
+			Q_rec[:nx, :] *= scaling_params[0]
+			Q_rec[nx:, :] *= scaling_params[1]
+
+			if CENTERING:
+				Q_rec += temporal_mean_global[:, None]			
+			pod_error = np.linalg.norm(
+				Q_global_original - Q_rec
+			) / np.linalg.norm(Q_global_original)
+
+			print("POD reconstruction error:", pod_error)
 			# extract and save to disk the approximate full state at the time instants specified in target_time_instants 
 			#for target_var_index in range(ns):
 			#	Phir_full_state 			= Phir_global[target_var_index*nx : (target_var_index + 1)*nx, :]
@@ -285,26 +323,49 @@ def solve(r):
 			
 
 			# extracting approximate full states all time instances
-			Phir_full_state 			= Phir_global
-			temporal_mean_full_state 	= temporal_mean_global
+			Phir_full_state = Phir_global
+			temporal_mean_full_state = temporal_mean_global
 
-			full_state_rec = Phir_full_state @ Qtilde_OpInf_opt.T + temporal_mean_full_state[:, np.newaxis]
+			# Reconstruct in centered/scaled coordinates
+			full_state_rec = Phir_full_state @ Qtilde_OpInf_opt.T
+
+			# Undo scaling
+			if SCALING:
+				for j in range(ns):
+					full_state_rec[j*nx:(j+1)*nx, :] *= scaling_params[j]
+
+			# Undo centering
+			if CENTERING:
+				full_state_rec += temporal_mean_full_state[:, np.newaxis]			
 			print(Phir_full_state.shape)
 			print(full_state_rec.shape)
 			print(Q_global.shape)
 
 			# computing error in the original basis for the training data
-			full_solution_error_nt = compute_train_err(Q_global.T, full_state_rec.T[:nt, :])
+			full_solution_error_nt = compute_train_err(
+				Q_global_original.T,
+				full_state_rec.T[:nt, :]
+			)
+
 			print("Normalized Error for both state vars:    " + str(full_solution_error_nt), file=out_file)
 
 			# computing the error for the predicted snapshots
-			pred_err = compute_train_err(Q_global_pred.T, full_state_rec.T[nt:, :])
+			pred_err = compute_train_err(
+			Q_global_pred.T,
+			full_state_rec.T[nt:, :])			
+
 			print("Normalized Error for both state vars:    " + str(pred_err), file=out_file)
 
 
 			# computing the error the same way the Challenge writers did
-			chal_err_train = np.mean( np.square(Q_global.T - full_state_rec.T[:nt, :])  ) / np.mean( np.square(Q_global) )
-			chal_err_test = np.mean( np.square(Q_global_pred.T - full_state_rec.T[nt:, :])  ) / np.mean( np.square(Q_global_pred) )
+			chal_err_train = (
+				np.mean((Q_global_original.T - full_state_rec.T[:nt, :])**2)
+				/ np.mean(Q_global_original**2)
+			)			
+			chal_err_test = (
+				np.mean((Q_global_pred.T - full_state_rec.T[nt:, :])**2)
+				/ np.mean(Q_global_pred**2)
+			)
 			print("Training Error defined from Challenge:", chal_err_train)
 			print("Forecasting Error defined from Challenge:", chal_err_test)
 
@@ -343,7 +404,8 @@ def solve(r):
 		full_solution_error_nt = None
 		pred_err = None
 		# comparing against unused sigmas
-		sigma_error = sum(eigs[r:])
+		sigmas = [np.sqrt(eigenvalue) for eigenvalue in eigs[r:] if eigenvalue >=0]
+		sigma_error = sum(sigmas)
 		print("Error from unused sigmas:                " + str(sigma_error), file=out_file)
 		###### POSTPROCESSING END ######
 	main_end = time()
@@ -365,7 +427,7 @@ pred = []
 sigma = []
 eigs_nested = []
 times = []
-min_r = 10
+min_r = 20
 max_r = 50
 
 # possible max rank values
