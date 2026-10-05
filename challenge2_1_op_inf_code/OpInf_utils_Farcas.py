@@ -93,25 +93,55 @@ def compute_train_err(Qhat_train, Qtilde_train):
 
 	return train_err
 
-def solve_opinf_difference_model(qhat0, n_steps_pred, dOpInf_red_model):
-	"""
-	solve_opinf_difference_model solves the discrete OpInf ROM for n_steps_pred over the target time horizon (training + prediction)
+def solve_opinf_difference_model(
+    qhat0,
+    n_steps_pred,
+    dOpInf_red_model,
+    max_norm=1000.0
+):
+    """
+    Solve the discrete OpInf ROM over n_steps_pred time steps.
 
-	:qhat0: 			reduced initial condition Qtilde0=np.matmul (Vr.T, q[:, 0]
-	:n_steps_pred: 		number of steps over the target time horizon to solve the OpInf reduced model
-	:dOpInf_red_model: 	dOpInf ROM
+    Terminates early if the reduced state becomes non-finite or exceeds
+    max_norm. This prevents unstable beta candidates from wasting time
+    propagating an already-diverged solution.
 
-	:return: contains_nan flag indicating NaN presence in in the Qtilde_train reduced solution, Qtilde
-	"""
+    Returns
+    -------
+    contains_nans : bool
+        True if the trajectory became unstable/non-finite or exceeded max_norm.
+    Qtilde : ndarray
+        Reduced trajectory with shape (n_steps_completed, r).
+    """
 
-	Qtilde    		= np.zeros((np.size(qhat0), n_steps_pred))
-	contains_nans  	= False
+    r = np.size(qhat0)
 
-	Qtilde[:, 0] = qhat0
-	for i in range(n_steps_pred - 1):
-		Qtilde[:, i + 1] = dOpInf_red_model(Qtilde[:, i])
-	
-	if np.any(np.isnan(Qtilde)):
-		contains_nans = True
+    Qtilde = np.zeros((r, n_steps_pred))
+    Qtilde[:, 0] = qhat0
 
-	return contains_nans, Qtilde.T
+    for i in range(n_steps_pred - 1):
+
+        x = Qtilde[:, i]
+
+        # Check current state before evaluating the model
+        if not np.all(np.isfinite(x)):
+            return True, Qtilde[:, :i + 1].T
+
+        # Stop if solution is clearly diverging
+        if np.max(np.abs(x)) > max_norm:
+            return True, Qtilde[:, :i + 1].T
+
+        # Evaluate next state
+        x_next = dOpInf_red_model(x)
+
+        # Check for NaN/Inf immediately
+        if not np.all(np.isfinite(x_next)):
+            return True, Qtilde[:, :i + 1].T
+
+        # Stop runaway trajectories
+        if np.max(np.abs(x_next)) > max_norm:
+            return True, Qtilde[:, :i + 2].T
+
+        Qtilde[:, i + 1] = x_next
+
+    return False, Qtilde.T
